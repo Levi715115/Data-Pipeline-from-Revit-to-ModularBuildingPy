@@ -1,0 +1,112 @@
+{
+  "Uuid": "7cb2bba2-3211-419b-bac1-e2faf5d822b1",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "Floor Beam Export",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n# Dynamo CPython3 for Revit 2024+\r\n# W-section floor beams -> split into REGULAR vs BRACED and export min/max length per (story, section).\r\n# Braced if an HS/HSS \"square\" member:\r\n#   (a) touches the beam in plan (segment-segment min distance <= 0.15 m), AND\r\n#   (b) has at least one end Z within +/-0.6 m of the beam Z, AND\r\n#   (c) forms an angle (5°~85°) to the beam axis in the beam's vertical plane (XZ / YZ).\r\n# Levels whose name contains \"ceiling\" are skipped. CSVs sorted by story index 1..32.\r\n\r\nimport clr, sys, os, re, math, csv, datetime as _dt\r\nclr.AddReference('RevitAPI'); clr.AddReference('RevitServices')\r\nfrom Autodesk.Revit.DB import (\r\n    FilteredElementCollector, BuiltInCategory, BuiltInParameter,\r\n    Level, Line, XYZ, ElementId\r\n)\r\nfrom RevitServices.Persistence import DocumentManager\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\n\r\n\r\nOUT_DIR = r\"C:\\Users\\Levi\\Desktop\\Final_MDY_Export\".strip().rstrip(\"\\\\/\")\r\nREGULAR_CSV = os.path.join(OUT_DIR, \"floor_beam_regular.csv\")\r\nBRACED_CSV  = os.path.join(OUT_DIR, \"floor_beam_braced.csv\")\r\n\r\nFT_TO_M = 0.3048\r\nM_TO_FT = 1.0 / FT_TO_M\r\n\r\n# thresholds\r\nANG_BEAM_TOL_DEG = 7.5       # beam is X-like if angle_to_x <= 7.5°, Y-like if >= 82.5°\r\nANGLE_MIN = 5.0              \r\nANGLE_MAX = 85.0\r\nPLAN_ATTACH_TOL_M = 0.15\r\nPLAN_ATTACH_TOL_FT = PLAN_ATTACH_TOL_M * M_TO_FT\r\nZ_END_TOL_M = 0.6            \r\nZ_END_TOL_FT = Z_END_TOL_M * M_TO_FT\r\n\r\ndef is_floor_level_name(name):\r\n    return \"ceiling\" not in (name or \"\").lower()\r\n\r\ndef story_index(name):\r\n    if not name: return 10_000\r\n    m = re.search(r'(\\d+)', name)\r\n    if not m: return 10_000\r\n    n = int(m.group(1))\r\n    if 1 <= n <= 32: return n\r\n    return 9_000 + n\r\n\r\ndef angle_to_x(vec):\r\n    return math.degrees(math.atan2(abs(vec.Y), abs(vec.X))) \r\n\r\ndef is_x_like(vec): return angle_to_x(vec) <= ANG_BEAM_TOL_DEG\r\ndef is_y_like(vec): return angle_to_x(vec) >= (90.0 - ANG_BEAM_TOL_DEG)\r\n\r\ndef norm2(v): return math.sqrt(v.X*v.X + v.Y*v.Y + v.Z*v.Z)\r\n\r\ndef angle_between(u, v):\r\n    nu = norm2(u); nv = norm2(v)\r\n    if nu < 1e-9 or nv < 1e-9: return None\r\n    dot = (u.X*v.X + u.Y*v.Y + u.Z*v.Z) / (nu*nv)\r\n    dot = max(-1.0, min(1.0, dot))\r\n    return math.degrees(math.acos(dot))\r\n\r\ndef proj_XZ(v): return XYZ(v.X, 0.0, v.Z)\r\ndef proj_YZ(v): return XYZ(0.0, v.Y, v.Z)\r\n\r\ndef get_type_and_family_strings(elem):\r\n    tname = \"\"; fname = \"\"\r\n    try:\r\n        sym = doc.GetElement(elem.GetTypeId())\r\n        if sym:\r\n            p = sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)\r\n            if p: tname = p.AsString() or \"\"\r\n            fam = getattr(sym, \"Family\", None)\r\n            if fam and fam.Name: fname = fam.Name\r\n    except: pass\r\n    return tname, fname\r\n\r\ndef get_section_string(elem):\r\n    tname, _ = get_type_and_family_strings(elem)\r\n    return tname or (elem.Name if hasattr(elem, \"Name\") else \"UNKNOWN\")\r\n\r\ndef is_w_section(section_name):\r\n    if not section_name: return False\r\n    s = section_name.strip().upper().replace(\" \", \"\").replace(\"×\", \"X\")\r\n    return bool(re.match(r\"^W\\d\", s))\r\n\r\ndef is_hs_or_hss_square(type_or_family):\r\n    \"\"\"\r\n    True for HS/HSS square tubes:\r\n      - accepts 'HS' or 'HSS' prefix \r\n      - determines 'square' by first two dimensions being equal within 5%\r\n    \"\"\"\r\n    s = (type_or_family or \"\").upper().replace(\" \", \"\").replace(\"×\", \"X\")\r\n    if (\"HS\" not in s) and (\"HSS\" not in s):\r\n        return False\r\n    # capture first two numeric dims after HS/HSS\r\n    m = re.search(r'(?:HSS|HS)[^0-9]*([0-9]+(?:\\.[0-9]+)?)X([0-9]+(?:\\.[0-9]+)?)', s)\r\n    if not m: \r\n        return False\r\n    a = float(m.group(1)); b = float(m.group(2))\r\n    if a <= 0 or b <= 0: \r\n        return False\r\n    return abs(a - b) / max(a, b) <= 0.05  \r\n\r\ndef get_elem_line(elem):\r\n    try:\r\n        loc = elem.Location\r\n        if hasattr(loc, \"Curve\"):\r\n            crv = loc.Curve\r\n            if isinstance(crv, Line):\r\n                return crv\r\n    except: pass\r\n    return None\r\n\r\ndef get_beam_length_m(elem):\r\n    try:\r\n        p = elem.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)\r\n        if p:\r\n            Lft = p.AsDouble()\r\n            if Lft and Lft > 0: return Lft * FT_TO_M\r\n    except: pass\r\n    crv = get_elem_line(elem)\r\n    return crv.Length * FT_TO_M if crv else 0.0\r\n\r\ndef p2d(xyz): return (xyz.X, xyz.Y)\r\n\r\ndef segs_intersect_2d(a1, a2, b1, b2):\r\n    def orient(p, q, r): return (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0])\r\n    def onseg(p, q, r):\r\n        return (min(p[0], r[0])-1e-9 <= q[0] <= max(p[0], r[0])+1e-9 and\r\n                min(p[1], r[1])-1e-9 <= q[1] <= max(p[1], r[1])+1e-9)\r\n    o1 = orient(a1,a2,b1); o2 = orient(a1,a2,b2)\r\n    o3 = orient(b1,b2,a1); o4 = orient(b1,b2,a2)\r\n    if (o1*o2 < 0) and (o3*o4 < 0): return True\r\n    if abs(o1)<1e-9 and onseg(a1,b1,a2): return True\r\n    if abs(o2)<1e-9 and onseg(a1,b2,a2): return True\r\n    if abs(o3)<1e-9 and onseg(b1,a1,b2): return True\r\n    if abs(o4)<1e-9 and onseg(b1,a2,b2): return True\r\n    return False\r\n\r\ndef dist_point_to_seg_2d(pt, a, b):\r\n    px, py = pt; ax, ay = a; bx, by = b\r\n    vx, vy = bx-ax, by-ay; wx, wy = px-ax, py-ay\r\n    c1 = vx*wx + vy*wy\r\n    if c1 <= 0: return math.hypot(wx, wy)\r\n    c2 = vx*vx + vy*vy\r\n    if c2 <= 1e-12: return math.hypot(wx, wy)\r\n    t = c1 / c2\r\n    if t >= 1.0: return math.hypot(px-bx, py-by)\r\n    projx, projy = ax + t*vx, ay + t*vy\r\n    return math.hypot(px-projx, py-projy)\r\n\r\ndef seg_min_dist_2d(a1, a2, b1, b2):\r\n    if segs_intersect_2d(a1,a2,b1,b2): return 0.0\r\n    return min(\r\n        dist_point_to_seg_2d(a1, b1, b2),\r\n        dist_point_to_seg_2d(a2, b1, b2),\r\n        dist_point_to_seg_2d(b1, a1, a2),\r\n        dist_point_to_seg_2d(b2, a1, a2),\r\n    )\r\n\r\ndef plan_touch(beam_line, other_line):\r\n    b1 = p2d(beam_line.GetEndPoint(0)); b2 = p2d(beam_line.GetEndPoint(1))\r\n    s  = p2d(other_line.GetEndPoint(0)); e  = p2d(other_line.GetEndPoint(1))\r\n    return seg_min_dist_2d(b1,b2,s,e) <= PLAN_ATTACH_TOL_FT\r\n\r\ndef endpoint_z_matches(beam_line, other_line):\r\n    bz = 0.5 * (beam_line.GetEndPoint(0).Z + beam_line.GetEndPoint(1).Z)\r\n    return (abs(other_line.GetEndPoint(0).Z - bz) <= Z_END_TOL_FT or\r\n            abs(other_line.GetEndPoint(1).Z - bz) <= Z_END_TOL_FT)\r\n\r\ndef angle_in_vertical_plane_ok(beam_dir, hs_dir):\r\n    if is_x_like(beam_dir):\r\n        u = proj_XZ(hs_dir); v = XYZ(1,0,0)  # X-axis in XZ plane\r\n    elif is_y_like(beam_dir):\r\n        u = proj_YZ(hs_dir); v = XYZ(0,1,0)  # Y-axis in YZ plane\r\n    else:\r\n        u = proj_YZ(hs_dir); v = XYZ(0,1,0)\r\n    ang = angle_between(u, v)\r\n    return (ang is not None) and (ANGLE_MIN <= ang <= ANGLE_MAX)\r\n\r\ndef safe_write_csv(path, header, rows):\r\n    if not os.path.isdir(OUT_DIR): os.makedirs(OUT_DIR)\r\n    def _open(p): return open(p, \"w\", newline=\"\", encoding=\"utf-8\")\r\n    try:\r\n        f = _open(path)\r\n    except PermissionError:\r\n        stamp = _dt.datetime.now().strftime(\"%Y%m%d_%H%M%S\")\r\n        base, ext = os.path.splitext(path)\r\n        path = base + \"_\" + stamp + ext\r\n        f = _open(path)\r\n    with f:\r\n        w = csv.writer(f); w.writerow(header)\r\n        for r in rows: w.writerow(r)\r\n    return path\r\n\r\n# Floor levels\r\nlevels = [lv for lv in FilteredElementCollector(doc).OfClass(Level) if is_floor_level_name(lv.Name)]\r\nfloor_ids = set(lv.Id.IntegerValue for lv in levels)\r\nlevel_name_by_id = {lv.Id.IntegerValue: lv.Name for lv in levels}\r\n\r\n# All structural framing\r\nall_fr = list(FilteredElementCollector(doc)\r\n              .OfCategory(BuiltInCategory.OST_StructuralFraming)\r\n              .WhereElementIsNotElementType())\r\n\r\n#  Build HS/HSS-square brace pool \r\nbrace_pool = []  \r\nfor e in all_fr:\r\n    line = get_elem_line(e)\r\n    if not line: \r\n        continue\r\n    tname, fname = get_type_and_family_strings(e)\r\n    if not (is_hs_or_hss_square(tname) or is_hs_or_hss_square(fname)):\r\n        continue\r\n    brace_pool.append({\"line\": line, \"dir\": line.Direction})\r\n\r\n# Iterate W-beams on floor levels \r\nregular = {} \r\nbraced  = {}\r\n\r\nfor e in all_fr:\r\n    # filter level\r\n    try:\r\n        p = e.get_Parameter(BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)\r\n        if not p: continue\r\n        lid = p.AsElementId()\r\n        if not lid or lid.IntegerValue not in floor_ids: continue\r\n        story = level_name_by_id.get(lid.IntegerValue, None)\r\n        if not story: continue\r\n    except: \r\n        continue\r\n\r\n    line = get_elem_line(e)\r\n    if not line: \r\n        continue\r\n\r\n    # beam orientation \r\n    bdir = line.Direction\r\n    if not (is_x_like(bdir) or is_y_like(bdir)):\r\n        continue\r\n\r\n    # W-section only\r\n    section = get_section_string(e)\r\n    if not is_w_section(section):\r\n        continue\r\n\r\n    # real length\r\n    Lm = get_beam_length_m(e)\r\n    if Lm <= 1e-6: \r\n        continue\r\n\r\n    # brace check\r\n    is_braced = False\r\n    for br in brace_pool:\r\n        # must touch in plan\r\n        if not plan_touch(line, br[\"line\"]):\r\n            continue\r\n        # brace endpoint Z near this beam Z\r\n        if not endpoint_z_matches(line, br[\"line\"]):\r\n            continue\r\n        # in beam vertical plane, must form an angle\r\n        if not angle_in_vertical_plane_ok(bdir, br[\"dir\"]):\r\n            continue\r\n        is_braced = True\r\n        break\r\n\r\n    key = (story, section)\r\n    (braced if is_braced else regular).setdefault(key, []).append(Lm)\r\n\r\n#  sort by story \r\ndef to_rows_sorted(groups):\r\n    items = []\r\n    for (story, section), lens in groups.items():\r\n        if not lens: continue\r\n        items.append((story_index(story), story, section,\r\n                      round(min(lens),3), round(max(lens),3)))\r\n    items.sort(key=lambda t: (t[0], t[1], t[2]))\r\n    return [[story, section, mn, mx] for (_i, story, section, mn, mx) in items]\r\n\r\nrows_regular = to_rows_sorted(regular)\r\nrows_braced  = to_rows_sorted(braced)\r\n\r\n# Write CSVs \r\nheader = [\"story\", \"section\", \"min_length\", \"max_length\"]\r\nreg_path = safe_write_csv(REGULAR_CSV, header, rows_regular)\r\nbra_path = safe_write_csv(BRACED_CSV,  header, rows_braced)\r\n\r\nOUT = {\r\n    \"regular_csv\": reg_path,\r\n    \"braced_csv\":  bra_path,\r\n    \"regular_count\": len(rows_regular),\r\n    \"braced_count\":  len(rows_braced),\r\n    \"regular_preview\": [header] + rows_regular[:min(10,len(rows_regular))],\r\n    \"braced_preview\":  [header] + rows_braced[:min(10,len(rows_braced))]\r\n}\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "2a53eb18259f46ecb9f6c7ae81852a3d",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "107f28b5661640c49de4636d3adb4c4d",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "8ab21ac7fdd14a3eabe6e1a6fc2928cd",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    }
+  ],
+  "Connectors": [],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Automatic",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "2a53eb18259f46ecb9f6c7ae81852a3d",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 753.5,
+        "Y": 395.0
+      }
+    ],
+    "Annotations": [],
+    "X": 0.0,
+    "Y": 0.0,
+    "Zoom": 1.0
+  }
+}

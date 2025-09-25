@@ -1,0 +1,112 @@
+{
+  "Uuid": "dec3b598-4fe1-44b0-833c-433cc5c52eb2",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "Brace Export",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n# Dynamo CPython3 for Revit 2024+\r\n# HS/HSS (square) braces -> one CSV:\r\n# story, section, direction, min_length, max_length\r\n# Direction is taken from the brace's own plan major axis (no beam association).\r\n\r\nimport clr, sys, os, re, math, csv, datetime as _dt\r\nclr.AddReference('RevitAPI'); clr.AddReference('RevitServices')\r\nfrom Autodesk.Revit.DB import (\r\n    FilteredElementCollector, BuiltInCategory, BuiltInParameter,\r\n    Level, Line, XYZ\r\n)\r\nfrom RevitServices.Persistence import DocumentManager\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\n\r\n\r\nOUT_DIR  = r\"C:\\Users\\Levi\\Desktop\\Final_MDY_Export\".strip().rstrip(\"\\\\/\")\r\nCSV_PATH = os.path.join(OUT_DIR, \"brace.csv\")\r\nFT_TO_M  = 0.3048\r\n\r\n\r\ndef story_index(name):\r\n    if not name: return 10_000\r\n    m = re.search(r'(\\d+)', name)\r\n    if not m: return 10_000\r\n    n = int(m.group(1))\r\n    if 1 <= n <= 32: return n\r\n    return 9_000 + n\r\n\r\ndef get_type_and_family_strings(e):\r\n    tname = \"\"; fname = \"\"\r\n    try:\r\n        sym = doc.GetElement(e.GetTypeId())\r\n        if sym:\r\n            p = sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)\r\n            if p: tname = p.AsString() or \"\"\r\n            fam = getattr(sym, \"Family\", None)\r\n            if fam and fam.Name: fname = fam.Name\r\n    except: pass\r\n    return tname, fname\r\n\r\ndef section_name(e):\r\n    t, _ = get_type_and_family_strings(e)\r\n    return t or (e.Name if hasattr(e, \"Name\") else \"UNKNOWN\")\r\n\r\ndef is_hs_or_hss_square(name_or_family):\r\n    s = (name_or_family or \"\").upper().replace(\" \", \"\").replace(\"×\", \"X\")\r\n    if (\"HS\" not in s) and (\"HSS\" not in s): return False\r\n    m = re.search(r'(?:HSS|HS)[^0-9]*([0-9]+(?:\\.[0-9]+)?)X([0-9]+(?:\\.[0-9]+)?)', s)\r\n    if not m: return False\r\n    a = float(m.group(1)); b = float(m.group(2))\r\n    if a <= 0 or b <= 0: return False\r\n    return abs(a - b) / max(a, b) <= 0.05  \r\n\r\ndef get_line(e):\r\n    try:\r\n        loc = e.Location\r\n        if hasattr(loc, \"Curve\"):\r\n            crv = loc.Curve\r\n            if isinstance(crv, Line):\r\n                return crv\r\n    except: pass\r\n    return None\r\n\r\ndef real_length_m(e):\r\n    try:\r\n        p = e.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)\r\n        if p:\r\n            Lft = p.AsDouble()\r\n            if Lft and Lft > 0: return Lft * FT_TO_M\r\n    except: pass\r\n    ln = get_line(e)\r\n    return ln.Length * FT_TO_M if ln else 0.0\r\n\r\ndef brace_direction_from_self(line_dir):\r\n    # Classification using plane principal axis\r\n    dx, dy = abs(line_dir.X), abs(line_dir.Y)\r\n    # For inclined parts close to 45°, the ratio of the main axis is used to determine the angle; geometrically, they will still fall into one of two categories\r\n    return \"west-east\" if dx >= dy else \"south-north\"\r\n\r\ndef safe_write_csv(path, header, rows):\r\n    if not os.path.isdir(OUT_DIR): os.makedirs(OUT_DIR)\r\n    def _open(p): return open(p, \"w\", newline=\"\", encoding=\"utf-8\")\r\n    try:\r\n        f = _open(path)\r\n    except PermissionError:\r\n        stamp = _dt.datetime.now().strftime(\"%Y%m%d_%H%M%S\")\r\n        base, ext = os.path.splitext(path)\r\n        f = _open(base + \"_\" + stamp + ext)\r\n    with f:\r\n        w = csv.writer(f); w.writerow(header); w.writerows(rows)\r\n    return path\r\n\r\n\r\nlevels = list(FilteredElementCollector(doc).OfClass(Level))\r\nlevel_name_by_id = {lv.Id.IntegerValue: lv.Name for lv in levels}\r\n\r\nall_fr = list(FilteredElementCollector(doc)\r\n              .OfCategory(BuiltInCategory.OST_StructuralFraming)\r\n              .WhereElementIsNotElementType())\r\n\r\n# Filter braces & aggregate\r\ngroups = {}  \r\n\r\nfor e in all_fr:\r\n    line = get_line(e)\r\n    if not line: continue\r\n\r\n    tname, fname = get_type_and_family_strings(e)\r\n    if not (is_hs_or_hss_square(tname) or is_hs_or_hss_square(fname)):\r\n        continue  \r\n\r\n    sec = section_name(e)\r\n    Lm  = real_length_m(e)\r\n    if Lm <= 1e-6: continue\r\n\r\n    # story\r\n    story = None\r\n    try:\r\n        p = e.get_Parameter(BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)\r\n        if p:\r\n            lid = p.AsElementId()\r\n            if lid: story = level_name_by_id.get(lid.IntegerValue, None)\r\n    except: pass\r\n    if not story: story = \"UNKNOWN\"\r\n\r\n    # Use the main axis of the brace itself\r\n    dlab = brace_direction_from_self(line.Direction)\r\n\r\n    groups.setdefault((story, sec, dlab), []).append(Lm)\r\n\r\n#  sort -\r\nitems = []\r\nfor (story, sec, dlab), lens in groups.items():\r\n    if not lens: continue\r\n    items.append((story_index(story), story, sec, dlab,\r\n                  round(min(lens), 3), round(max(lens), 3)))\r\nitems.sort(key=lambda t: (t[0], t[1], t[2], t[3]))\r\n\r\nrows = [[story, sec, dlab, mn, mx] for (_i, story, sec, dlab, mn, mx) in items]\r\n\r\n\r\nheader = [\"story\", \"section\", \"direction\", \"min_length\", \"max_length\"]\r\ncsv_path = safe_write_csv(CSV_PATH, header, rows)\r\n\r\nOUT = {\"csv\": csv_path, \"preview\": [header] + rows[:12]}\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "e60f0ade80bb4973a6aedd28766cb009",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "7d8887872c7947188285141721e34c9d",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "11669023b39c47939fe9c778b53ecd61",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    }
+  ],
+  "Connectors": [],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Automatic",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "e60f0ade80bb4973a6aedd28766cb009",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 753.5,
+        "Y": 395.0
+      }
+    ],
+    "Annotations": [],
+    "X": 0.0,
+    "Y": 0.0,
+    "Zoom": 1.0
+  }
+}

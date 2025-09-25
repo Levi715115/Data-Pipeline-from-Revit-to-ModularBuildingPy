@@ -1,0 +1,21 @@
+gap_we (m),0.35
+module,we-dir,sn-dir,location,brace
+1,3.5,12.0,south-west,"[{""side"":""west"",""range"":""0.3-end"",""type"":""Chevron""}]"
+2,3.5,10.4,north-1,"[{""side"":""west"",""range"":""entire"",""type"":""Chevron""}]"
+3,3.5,12.0,east-1,[]
+4,3.5,10.4,north-3,[]
+5,3.5,12.0,east-3,"[{""side"":""east"",""range"":""start-6.65"",""type"":""Chevron""}]"
+6,3.5,10.4,north-5,"[{""side"":""east"",""range"":""3.05-end"",""type"":""Chevron""}]"
+7,8.8,3.15,east-5,"[{""side"":""south"",""range"":""entire"",""type"":""Chevron""}]"
+8,8.8,3.145,north-7,"[{""side"":""north"",""range"":""entire"",""type"":""Chevron""}]"
+9,8.8,2.9,north-8,[]
+10,8.8,2.1,north-9,"[{""side"":""north"",""range"":""entire"",""type"":""Chevron""}]"
+11,8.8,2.7,north-10,"[{""side"":""south"",""range"":""entire"",""type"":""Chevron""},{""side"":""north"",""range"":""entire"",""type"":""Chevron""}]"
+12,8.8,3.5,north-11,"[{""side"":""south"",""range"":""entire"",""type"":""Chevron""}]"
+13,8.8,3.5,north-12,"[{""side"":""north"",""range"":""entire"",""type"":""Chevron""}]"
+14,3.5,12.0,east-7,"[{""side"":""west"",""range"":""start-6.65"",""type"":""Chevron""}]"
+15,3.5,10.4,north-14,"[{""side"":""west"",""range"":""3.05-end"",""type"":""Chevron""}]"
+16,3.5,12.0,east-14,[]
+17,3.5,10.4,north-16,[]
+18,3.5,12.0,east-16,[]
+19,3.5,10.4,north-18,"[{""side"":""east"",""range"":""entire"",""type"":""Chevron""}]"

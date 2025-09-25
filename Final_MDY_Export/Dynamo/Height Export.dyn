@@ -1,0 +1,195 @@
+{
+  "Uuid": "52657b36-3469-4af8-a9b1-955b481a9f70",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "Height Export",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "DSRevitNodesUI.Categories, DSRevitNodesUI",
+      "SelectedIndex": 290,
+      "SelectedString": "OST_Levels",
+      "Id": "3babc7ac47c74111aeb82a88f33668f1",
+      "NodeType": "ExtensionNode",
+      "Inputs": [],
+      "Outputs": [
+        {
+          "Id": "73094601932144bfb0779fbce26e3079",
+          "Name": "Category",
+          "Description": "The selected Category.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "All built-in categories."
+    },
+    {
+      "ConcreteType": "DSRevitNodesUI.ElementsOfCategory, DSRevitNodesUI",
+      "Id": "28319e8c99ab48f1b95c6b8a6005b10f",
+      "NodeType": "ExtensionNode",
+      "Inputs": [
+        {
+          "Id": "36b5631730b44f558f9541ddde76de3c",
+          "Name": "Category",
+          "Description": "The Category",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "1007d28d0c654b8499c6319d618d1f1e",
+          "Name": "Elements",
+          "Description": "An element class.",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Get all elements of the specified category from the model."
+    },
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# Dynamo Python Script - Export Level heights to CSV (meters)\r\n# module = same-story thickness = (Ceiling - Floor)\r\n# vertical_con = nextFloor - thisCeiling (top story -> 0.0)\r\n\r\nimport clr, re, os\r\n\r\n# Revit plumbing\r\nclr.AddReference('RevitAPI')\r\nclr.AddReference('RevitServices')\r\nfrom Autodesk.Revit.DB import FilteredElementCollector, Level\r\nfrom RevitServices.Persistence import DocumentManager\r\n\r\n# .NET IO\r\nfrom System.IO import Directory, StreamWriter, Path\r\nfrom System.Text import UTF8Encoding\r\n\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\n\r\n# ---------- Config ----------\r\nEXPORT_DIR  = r\"C:\\Users\\Levi\\Desktop\\Final_MDY_Export\"\r\nEXPORT_FILE = \"height.csv\"\r\nEXPORT_PATH = Path.Combine(EXPORT_DIR, EXPORT_FILE)\r\n\r\nFT_TO_M = 0.3048  # feet → meters\r\n\r\ndef natural_key(s):\r\n    \"\"\"Ensure 'Level 10' sorts after 'Level 9'.\"\"\"\r\n    return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\\d+)', s or \"\")]\r\n\r\ndef match_ceiling(floor_name, floor_elev, ceil_dict, ceilings):\r\n    \"\"\"1) exact '<FloorName> Ceiling'  2) nearest ceiling strictly above.\"\"\"\r\n    target = floor_name + \" Ceiling\"\r\n    if target in ceil_dict:\r\n        return target, ceil_dict[target]\r\n    above = [(n, e) for (n, e) in ceilings if e > floor_elev]\r\n    if above:\r\n        n, e = min(above, key=lambda t: t[1] - floor_elev)\r\n        return n, e\r\n    return None, None\r\n\r\ndef csv_line(row):\r\n    \"\"\"Minimal CSV quoting.\"\"\"\r\n    parts = []\r\n    for v in row:\r\n        s = \"\" if v is None else str(v)\r\n        if any(ch in s for ch in [\",\", '\"', \"\\n\", \"\\r\"]):\r\n            s = '\"' + s.replace('\"', '\"\"') + '\"'\r\n        parts.append(s)\r\n    return \",\".join(parts)\r\n\r\n# ---------- Collect and sort levels ----------\r\nlevels = list(FilteredElementCollector(doc).OfClass(Level))\r\n\r\npairs  = []      # [(name, elev_m)]\r\nground = None\r\nfor lv in levels:\r\n    name   = lv.Name\r\n    elev_m = float(lv.Elevation) * FT_TO_M\r\n    pairs.append((name, elev_m))\r\n    if \"ground\" in (name or \"\").lower():\r\n        ground = (\"ground_level\", elev_m)\r\n\r\npairs.sort(key=lambda t: (t[1], natural_key(t[0])))\r\n\r\n# Split floors vs ceilings\r\nfloors   = [(n, e) for (n, e) in pairs if \"ceiling\" not in (n or \"\").lower() and \"ground\" not in (n or \"\").lower()]\r\nceilings = [(n, e) for (n, e) in pairs if \"ceiling\" in  (n or \"\").lower()]\r\nceil_dict = {n: e for (n, e) in ceilings}\r\n\r\n# ---------- Compute per story ----------\r\nrows = []\r\nfor i, (fname, f_e) in enumerate(floors):\r\n    cname, c_e = match_ceiling(fname, f_e, ceil_dict, ceilings)\r\n\r\n    if c_e is None:\r\n        # Missing ceiling → module (thickness) unknown\r\n        vcon = None\r\n        module = None\r\n        c_e_out = None\r\n    else:\r\n        # Same-story thickness (this is the desired \"module\")\r\n        module = c_e - f_e                       # ← FIXED: module = Ceiling - Floor\r\n        # vertical connector to next story\r\n        if i < len(floors) - 1:\r\n            next_floor_e = floors[i + 1][1]\r\n            vcon = next_floor_e - c_e\r\n            if vcon < -1e-6:\r\n                vcon = None\r\n        else:\r\n            vcon = 0.0                           # top story convention\r\n        c_e_out = round(c_e, 6)\r\n\r\n    rows.append([\r\n        fname,\r\n        round(f_e, 6),                            # Floor Elev (m)\r\n        cname or \"\",                              # Ceiling Level\r\n        c_e_out,                                  # Ceiling Elev (m)\r\n        None if vcon   is None else round(vcon, 6),   # vertical_con (m)\r\n        None if module is None else round(module, 6)  # module (m) = thickness\r\n    ])\r\n\r\n# ---------- Build table ----------\r\nheaders = [\"Level\", \"Floor Elev (m)\", \"Ceiling Level\", \"Ceiling Elev (m)\", \"vertical_con (m)\", \"module (m)\"]\r\ntable = []\r\ntable.append([\"ground_level (m)\", None if ground is None else round(ground[1], 6)])\r\ntable.append(headers)\r\ntable.extend(rows)\r\n\r\n# ---------- Write CSV (UTF-8 BOM for Excel) ----------\r\nDirectory.CreateDirectory(EXPORT_DIR)\r\nutf8_bom = UTF8Encoding(True)\r\nsw = StreamWriter(EXPORT_PATH, False, utf8_bom)\r\ntry:\r\n    for r in table:\r\n        sw.WriteLine(csv_line(r))\r\nfinally:\r\n    sw.Close()\r\n\r\nOUT = EXPORT_PATH\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "8397c544d2dc4328b9aad58f92b5c757",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "442e3b6742894aefad2471d9a48053e8",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "cf00de1c1ce0481da80903b21b32c308",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    }
+  ],
+  "Connectors": [
+    {
+      "Start": "73094601932144bfb0779fbce26e3079",
+      "End": "36b5631730b44f558f9541ddde76de3c",
+      "Id": "290b554169184b46b24ad2d5d0146a55",
+      "IsHidden": "False"
+    },
+    {
+      "Start": "1007d28d0c654b8499c6319d618d1f1e",
+      "End": "442e3b6742894aefad2471d9a48053e8",
+      "Id": "727806bb54df4eda85166f6348f7b7c0",
+      "IsHidden": "False"
+    }
+  ],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Automatic",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "3babc7ac47c74111aeb82a88f33668f1",
+        "Name": "Categories",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 63.235234323984912,
+        "Y": 79.6503623970862
+      },
+      {
+        "Id": "28319e8c99ab48f1b95c6b8a6005b10f",
+        "Name": "All Elements of Category",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 509.88673526174949,
+        "Y": 86.022004569309615
+      },
+      {
+        "Id": "8397c544d2dc4328b9aad58f92b5c757",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 942.32677804309276,
+        "Y": 98.413951801192752
+      }
+    ],
+    "Annotations": [],
+    "X": 178.06031725840705,
+    "Y": 354.21636667403777,
+    "Zoom": 0.88385192930220668
+  }
+}

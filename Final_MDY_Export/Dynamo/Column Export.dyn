@@ -1,0 +1,112 @@
+{
+  "Uuid": "5fb0687c-8aa6-4cb7-9bb8-a8dccee887cf",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "Column Export",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n# Revit 2024 + Dynamo CPython3\r\n# Column.csv: per-module brace edges -> column counts exactly on boundary ends (HSS square braces only)\r\n\r\nimport clr, os, re, math, json, csv, datetime as _dt\r\nclr.AddReference('RevitAPI'); clr.AddReference('RevitServices')\r\nfrom Autodesk.Revit.DB import *\r\nfrom RevitServices.Persistence import DocumentManager\r\n\r\ndoc   = DocumentManager.Instance.CurrentDBDocument\r\nuidoc = DocumentManager.Instance.CurrentUIApplication.ActiveUIDocument\r\n\r\n\r\nOUT_DIR  = r\"C:\\Users\\Levi\\Desktop\\Final_MDY_Export\".strip().rstrip(\"\\\\/\")\r\nCSV_PATH = os.path.join(OUT_DIR, \"Column.csv\")\r\n\r\nAREA_SCHEME_NAME = None        # None = use the currently active Area view's Scheme; or set to \"Rentable\"\r\nORDER_SERPENTINE = False       #False = every column goes south->north; True = snake-like (even columns go south->north, odd columns go north->south)\r\n\r\n\r\nINSIDE_TOL_M   = 0.005         # Bounding tolerance of a point within a rectangle\r\nEDGE_TOL_M     = 0.20          # Bracing end edge tolerance\r\nON_BOUND_TOL_M = 0.08          # Horizontal distance tolerance for “column on edge” judgment \r\nEND_WINDOW_M   = 1.05          # The length of the counting window from both ends of the edge\r\n\r\n\r\nFT_TO_M = 0.3048\r\nM_TO_FT = 1.0 / FT_TO_M\r\n\r\nINSIDE_TOL_FT  = INSIDE_TOL_M * M_TO_FT\r\nEDGE_TOL_FT    = EDGE_TOL_M   * M_TO_FT\r\nON_BOUND_TOL_FT= ON_BOUND_TOL_M*M_TO_FT\r\nEND_WINDOW_FT  = END_WINDOW_M * M_TO_FT\r\n\r\n\r\ndef safe_open_csv(path):\r\n    if not os.path.isdir(OUT_DIR):\r\n        os.makedirs(OUT_DIR)\r\n    try:\r\n        return open(path, \"w\", newline=\"\", encoding=\"utf-8-sig\")\r\n    except PermissionError:\r\n        base, ext = os.path.splitext(path)\r\n        p = base + \"_\" + _dt.datetime.now().strftime(\"%Y%m%d_%H%M%S\") + ext\r\n        return open(p, \"w\", newline=\"\", encoding=\"utf-8-sig\")\r\n\r\ndef get_target_scheme():\r\n    if AREA_SCHEME_NAME:\r\n        for s in FilteredElementCollector(doc).OfClass(AreaScheme):\r\n            if s.Name == AREA_SCHEME_NAME:\r\n                return s\r\n        raise Exception(\"Area Scheme '{}' not found\".format(AREA_SCHEME_NAME))\r\n    av = uidoc.ActiveView\r\n    if isinstance(av, ViewPlan) and av.ViewType == ViewType.AreaPlan:\r\n        return av.AreaScheme\r\n    raise Exception(\"Activate an Area Plan view, or set AREA_SCHEME_NAME.\")\r\n\r\ndef all_area_plans_in_scheme(scheme):\r\n    vs = [v for v in FilteredElementCollector(doc).OfClass(ViewPlan)\r\n          if v.ViewType==ViewType.AreaPlan and v.AreaScheme and v.AreaScheme.Id==scheme.Id]\r\n    vs.sort(key=lambda v: v.GenLevel.Elevation if v.GenLevel else 0.0)\r\n    return vs\r\n\r\ndef area_outer_bbox(area):\r\n    opt = SpatialElementBoundaryOptions()\r\n    loops = area.GetBoundarySegments(opt)\r\n    xs=[]; ys=[]\r\n    for segList in loops:\r\n        for seg in segList:\r\n            c = seg.GetCurve()\r\n            p0=c.GetEndPoint(0); p1=c.GetEndPoint(1)\r\n            xs += [p0.X, p1.X]; ys += [p0.Y, p1.Y]\r\n    if not xs or not ys: return None\r\n    return (min(xs), max(xs), min(ys), max(ys))\r\n\r\ndef seg_dist_param(pt, a, b):\r\n    vx=b.X-a.X; vy=b.Y-a.Y\r\n    wx=pt.X-a.X; wy=pt.Y-a.Y\r\n    L2=vx*vx+vy*vy\r\n    if L2<=1e-12: return 0.0, math.hypot(pt.X-a.X, pt.Y-a.Y)\r\n    t=max(0.0, min(1.0, (wx*vx+wy*vy)/L2))\r\n    proj=XYZ(a.X+vx*t, a.Y+vy*t, pt.Z)\r\n    d=math.hypot(pt.X-proj.X, pt.Y-proj.Y)\r\n    return t, d\r\n\r\ndef columns_on_level(level):\r\n    cols = FilteredElementCollector(doc)\\\r\n        .OfCategory(BuiltInCategory.OST_StructuralColumns)\\\r\n        .WhereElementIsNotElementType().ToElements()\r\n    out=[]\r\n    for c in cols:\r\n        try:\r\n            if c.LevelId.IntegerValue != level.Id.IntegerValue: continue\r\n            loc=c.Location\r\n            if isinstance(loc, LocationPoint): p=loc.Point\r\n            elif isinstance(loc, LocationCurve): p=loc.Curve.Evaluate(0.5, True)\r\n            else: \r\n                bb=c.get_BoundingBox(None); p=(bb.Min+bb.Max)/2.0\r\n            out.append((c, XYZ(p.X,p.Y,level.Elevation)))\r\n        except: pass\r\n    return out\r\n\r\ndef most_common_column_type(level_cols):\r\n    cnt={}\r\n    for c,_ in level_cols:\r\n        try:\r\n            t=doc.GetElement(c.GetTypeId())\r\n            nm = (t.LookupParameter(\"Type Name\").AsString()\r\n                  if t.LookupParameter(\"Type Name\")\r\n                  else t.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM).AsString())\r\n            cnt[nm]=cnt.get(nm,0)+1\r\n        except: pass\r\n    if not cnt: return \"\"\r\n    return max(cnt.items(), key=lambda kv: kv[1])[0]\r\n\r\n#HSS/HS square brace filtering \r\ndef get_type_and_family_strings(e):\r\n    tname=fname=\"\"\r\n    try:\r\n        sym=doc.GetElement(e.GetTypeId())\r\n        if sym:\r\n            p=sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)\r\n            if p: tname=p.AsString() or \"\"\r\n            fam=getattr(sym,\"Family\",None)\r\n            if fam and fam.Name: fname=fam.Name\r\n    except: pass\r\n    return tname, fname\r\n\r\ndef is_hs_or_hss_square(s):\r\n    s=(s or \"\").upper().replace(\" \",\"\").replace(\"×\",\"X\")\r\n    if (\"HS\" not in s) and (\"HSS\" not in s): return False\r\n    m=re.search(r'(?:HSS|HS)[^0-9]*([0-9]+(?:\\.[0-9]+)?)X([0-9]+(?:\\.[0-9]+)?)', s)\r\n    if not m: return False\r\n    a=float(m.group(1)); b=float(m.group(2))\r\n    return a>0 and b>0 and abs(a-b)/max(a,b) <= 0.05\r\n\r\ndef braces_on_level_hss_square(level):\r\n    fams = FilteredElementCollector(doc)\\\r\n        .OfCategory(BuiltInCategory.OST_StructuralFraming)\\\r\n        .WhereElementIsNotElementType().ToElements()\r\n    out=[]\r\n    lvl_id=level.Id.IntegerValue\r\n    for f in fams:\r\n        try:\r\n            tname,fname = get_type_and_family_strings(f)\r\n            if not (is_hs_or_hss_square(tname) or is_hs_or_hss_square(fname)):\r\n                continue\r\n            loc = getattr(f,\"Location\",None)\r\n            if not isinstance(loc, LocationCurve): \r\n                continue\r\n            ref = f.get_Parameter(BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM)\r\n            if not ref: \r\n                continue\r\n            rid = ref.AsElementId()\r\n            if not rid or rid.IntegerValue != lvl_id:\r\n                continue\r\n            c  = loc.Curve\r\n            p0 = c.GetEndPoint(0); p1 = c.GetEndPoint(1)\r\n            z  = level.Elevation\r\n            out.append((XYZ(p0.X,p0.Y,z), XYZ(p1.X,p1.Y,z)))\r\n        except: pass\r\n    return out\r\n\r\n# Determine \"which diagonal braces fall on a certain edge in the module rectangle\"\r\ndef braces_on_edges_in_rect(x0,x1,y0,y1, brace_pts):\r\n    z = 0.0\r\n    westA, westB   = XYZ(x0,y0,z), XYZ(x0,y1,z)  # 南->北\r\n    eastA, eastB   = XYZ(x1,y0,z), XYZ(x1,y1,z)\r\n    southA, southB = XYZ(x0,y0,z), XYZ(x1,y0,z)  # 西->东\r\n    northA, northB = XYZ(x0,y1,z), XYZ(x1,y1,z)\r\n\r\n    def map_to_edge(pt):\r\n        tW,dW = seg_dist_param(pt, westA,  westB)\r\n        tE,dE = seg_dist_param(pt, eastA,  eastB)\r\n        tS,dS = seg_dist_param(pt, southA, southB)\r\n        tN,dN = seg_dist_param(pt, northA, northB)\r\n        dmin=min(dW,dE,dS,dN)\r\n        if dmin==dW: return (\"west\",  tW, dW)\r\n        if dmin==dE: return (\"east\",  tE, dE)\r\n        if dmin==dS: return (\"south\", tS, dS)\r\n        return (\"north\", tN, dN)\r\n\r\n    braces=[]\r\n    for (p0,p1) in brace_pts:\r\n        if not ((x0-INSIDE_TOL_FT<=p0.X<=x1+INSIDE_TOL_FT and y0-INSIDE_TOL_FT<=p0.Y<=y1+INSIDE_TOL_FT) and\r\n                (x0-INSIDE_TOL_FT<=p1.X<=x1+INSIDE_TOL_FT and y0-INSIDE_TOL_FT<=p1.Y<=y1+INSIDE_TOL_FT)):\r\n            continue\r\n        (e0,t0,d0) = map_to_edge(p0)\r\n        (e1,t1,d1) = map_to_edge(p1)\r\n        if e0==e1 and max(d0,d1) <= EDGE_TOL_FT:\r\n            s_t, e_t = (t0,t1) if t0<=t1 else (t1,t0)\r\n            braces.append((e0, s_t, e_t))\r\n    return braces\r\n\r\n# Module sorting: West->East in columns; South->North in columns\r\ndef cluster(vals, tol_ft):\r\n    vals = sorted(vals)\r\n    bins=[]\r\n    for v in vals:\r\n        if not bins or abs(v - bins[-1][-1]) > tol_ft:\r\n            bins.append([v])\r\n        else:\r\n            bins[-1].append(v)\r\n    return [sum(b)/len(b) for b in bins]\r\n\r\ndef order_modules(rects, serpentine=False):\r\n    col_keys = cluster([r[\"x0\"] for r in rects], tol_ft=0.20*M_TO_FT)  \r\n    for r in rects:\r\n        r[\"col\"] = min(range(len(col_keys)), key=lambda i: abs(r[\"x0\"]-col_keys[i]))\r\n    columns=[]\r\n    for ci in sorted(set(r[\"col\"] for r in rects)):\r\n        col = sorted([r for r in rects if r[\"col\"]==ci], key=lambda r:r[\"y0\"]) \r\n        if serpentine and (ci % 2 == 1):\r\n            col = list(reversed(col))  \r\n        columns.append(col)\r\n    ordered=[]; mid=0\r\n    for col in columns:\r\n        for r in col:\r\n            mid+=1; r[\"id\"]=mid; ordered.append(r)\r\n    return ordered\r\n\r\n# Only count the columns that are on the edge and close to the endpoint\r\ndef count_on_edge_ends(A, B, level_cols):\r\n    \"\"\"\r\n    A, B: Edge endpoints (feet). South->North for vertical edges; West->East for horizontal edges.\r\n    Rules:\r\n    1) If the minimum distance from a point to a line segment is <= ON_BOUND_TOL_FT, the point is considered \"on that edge.\"\r\n    2) Calculate the arc length s (feet) along the edge. If s <= END_WINDOW_FT, calculate the arc length.\r\n    If (L - s) <= END_WINDOW_FT, calculate the arc length.\r\n    Return: (start_count, end_count)\r\n    \"\"\"\r\n    Lft = math.hypot(B.X - A.X, B.Y - A.Y)\r\n    if Lft <= 1e-9:\r\n        return (0, 0)\r\n\r\n    start_n = 0\r\n    end_n   = 0\r\n\r\n    for _c, p in level_cols:\r\n        t, d = seg_dist_param(p, A, B)   # d: feet; t: 0..1\r\n        if d <= ON_BOUND_TOL_FT and -1e-6 <= t <= 1+1e-6:\r\n            s = t * Lft\r\n            if s <= END_WINDOW_FT:\r\n                start_n += 1\r\n            elif (Lft - s) <= END_WINDOW_FT:\r\n                end_n += 1\r\n\r\n    return (start_n, end_n)\r\n\r\n\r\nscheme = get_target_scheme()\r\nviews  = all_area_plans_in_scheme(scheme)\r\nrows   = []\r\n\r\nfor v in views:\r\n    areas = [a for a in FilteredElementCollector(doc, v.Id)\r\n             .OfClass(SpatialElement) if isinstance(a, Area)]\r\n    rects=[]\r\n    for a in areas:\r\n        bbox = area_outer_bbox(a)\r\n        if not bbox: continue\r\n        x0,x1,y0,y1 = bbox\r\n        rects.append({\"x0\":x0,\"x1\":x1,\"y0\":y0,\"y1\":y1})\r\n    if not rects: \r\n        continue\r\n\r\n    ordered = order_modules(rects, serpentine=ORDER_SERPENTINE)\r\n    lvl_cols = columns_on_level(v.GenLevel)\r\n    section  = most_common_column_type(lvl_cols)\r\n    lvl_brs  = braces_on_level_hss_square(v.GenLevel)\r\n\r\n    for r in ordered:\r\n        x0,x1,y0,y1 = r[\"x0\"], r[\"x1\"], r[\"y0\"], r[\"y1\"]\r\n\r\n        brs = braces_on_edges_in_rect(x0,x1,y0,y1, lvl_brs)\r\n        if not brs:\r\n            continue  \r\n\r\n        \r\n        z = v.GenLevel.Elevation\r\n        westA, westB   = XYZ(x0,y0,z), XYZ(x0,y1,z)  #\r\n        eastA, eastB   = XYZ(x1,y0,z), XYZ(x1,y1,z)\r\n        southA, southB = XYZ(x0,y0,z), XYZ(x1,y0,z)  #\r\n        northA, northB = XYZ(x0,y1,z), XYZ(x1,y1,z)\r\n\r\n        edges_present = {edge for (edge, _ts, _te) in brs}\r\n        j = {}\r\n\r\n        if \"west\" in edges_present:\r\n            s,e = count_on_edge_ends(westA, westB, lvl_cols)\r\n            if s or e:\r\n                j[\"west-start\"] = s; j[\"west-end\"] = e\r\n        if \"east\" in edges_present:\r\n            s,e = count_on_edge_ends(eastA, eastB, lvl_cols)\r\n            if s or e:\r\n                j[\"east-start\"] = s; j[\"east-end\"] = e\r\n        if \"south\" in edges_present:\r\n            s,e = count_on_edge_ends(southA, southB, lvl_cols)\r\n            if s or e:\r\n                j[\"south-start\"] = s; j[\"south-end\"] = e\r\n        if \"north\" in edges_present:\r\n            s,e = count_on_edge_ends(northA, northB, lvl_cols)\r\n            if s or e:\r\n                j[\"north-start\"] = s; j[\"north-end\"] = e\r\n\r\n        rows.append([v.GenLevel.Name, section, \"M{}\".format(r[\"id\"]),\r\n                     json.dumps(j, separators=(',',':'))])\r\n\r\n# \r\nwith safe_open_csv(CSV_PATH) as f:\r\n    w = csv.writer(f)\r\n    w.writerow([\"level\",\"section\",\"module\",\"json\"])\r\n    w.writerows(rows)\r\n\r\nOUT = \"Done: wrote {} rows → {}\".format(len(rows), CSV_PATH)\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "d5259d122bba49088970aafe17317b86",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "d3a33a89ac524f66a8c442b98efcfd50",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "2e9342c62ad4468a9a23c7a6f113ed76",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    }
+  ],
+  "Connectors": [],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Manual",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "d5259d122bba49088970aafe17317b86",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 802.5,
+        "Y": 443.0
+      }
+    ],
+    "Annotations": [],
+    "X": 0.0,
+    "Y": 0.0,
+    "Zoom": 1.0
+  }
+}

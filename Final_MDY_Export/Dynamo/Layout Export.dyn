@@ -1,0 +1,112 @@
+{
+  "Uuid": "bd543825-6282-4916-a2c7-a0d90baa71a4",
+  "IsCustomNode": false,
+  "Description": "",
+  "Name": "Layout Export",
+  "ElementResolver": {
+    "ResolutionMap": {}
+  },
+  "Inputs": [],
+  "Outputs": [],
+  "Nodes": [
+    {
+      "ConcreteType": "PythonNodeModels.PythonNode, PythonNodeModels",
+      "Code": "# -*- coding: utf-8 -*-\r\n# Revit 2024+ / Dynamo CPython3\r\n# Area-based ModularPy layout extractor (ONE CSV)\r\n# - Orders modules column-wise (west->east), each column bottom->top\r\n# - Location strings per your spec: south-west / east-{id} / north-{id}\r\n# - we-dir = horizontal (E–W), sn-dir = vertical (N–S)\r\n# - Braces: HS/HSS square only; per-side ranges; module type = Chevron / X (robust)\r\n# - CSV first row is metadata: \"gap_we (m),<value>\"\r\n# - Then header: module,we-dir,sn-dir,location,brace (brace is a JSON-like string)\r\n\r\nimport clr, os, re, math, csv, json, datetime as _dt\r\nclr.AddReference('RevitAPI'); clr.AddReference('RevitServices')\r\nfrom Autodesk.Revit.DB import (\r\n    FilteredElementCollector, BuiltInCategory, BuiltInParameter,\r\n    Level, Area, SpatialElementBoundaryOptions, Line, XYZ\r\n)\r\nfrom RevitServices.Persistence import DocumentManager\r\ndoc = DocumentManager.Instance.CurrentDBDocument\r\n\r\n\r\nLEVEL_NAME     = \"Level 1\"   \r\nOUT_DIR        = r\"C:\\Users\\Levi\\Desktop\\Final_MDY_Export\".strip().rstrip(\"\\\\/\")\r\nCSV_PATH       = os.path.join(OUT_DIR, \"layout_all.csv\")\r\n\r\n# Tolerances (meters)\r\nFT_TO_M = 0.3048; M_TO_FT = 1.0/FT_TO_M\r\nANG_MIN_X_DEG  = 20.0        \r\nEDGE_MARGIN_M  = 0.20        \r\nEDGE_NEAR_M    = 0.25        \r\nMERGE_GAP_M    = 0.02        \r\nENTIRE_TOL_M   = 0.10       \r\nCOL_CLUSTER_M  = 0.20        \r\nRANGE_ROUND    = 2\r\n\r\n\r\ndef ensure_path(path):\r\n    if not os.path.isdir(OUT_DIR): os.makedirs(OUT_DIR)\r\n    try:\r\n        open(path,\"w\").close(); return path\r\n    except PermissionError:\r\n        base,ext=os.path.splitext(path)\r\n        return base+\"_\"+_dt.datetime.now().strftime(\"%Y%m%d_%H%M%S\")+ext\r\n\r\ndef is_hs_or_hss_square(s):\r\n    s=(s or \"\").upper().replace(\" \",\"\").replace(\"×\",\"X\")\r\n    if (\"HS\" not in s) and (\"HSS\" not in s): return False\r\n    m=re.search(r'(?:HSS|HS)[^0-9]*([0-9]+(?:\\.[0-9]+)?)X([0-9]+(?:\\.[0-9]+)?)', s)\r\n    if not m: return False\r\n    a=float(m.group(1)); b=float(m.group(2))\r\n    return a>0 and b>0 and abs(a-b)/max(a,b) <= 0.05\r\n\r\ndef get_type_family_name(e):\r\n    tn=fn=\"\"\r\n    try:\r\n        sym=doc.GetElement(e.GetTypeId())\r\n        if sym:\r\n            p=sym.get_Parameter(BuiltInParameter.SYMBOL_NAME_PARAM)\r\n            if p: tn=p.AsString() or \"\"\r\n            fam=getattr(sym,\"Family\",None)\r\n            if fam and fam.Name: fn=fam.Name\r\n    except: pass\r\n    return tn, fn\r\n\r\ndef get_line(e):\r\n    loc=getattr(e,\"Location\",None)\r\n    if not loc or not hasattr(loc,\"Curve\"): return None\r\n    crv=loc.Curve\r\n    return crv if isinstance(crv,Line) else None\r\n\r\ndef p2d(P): return (P.X,P.Y)\r\n\r\ndef seg_min_dist_2d(a1,a2,b1,b2):\r\n    def orient(p,q,r): return (q[0]-p[0])*(r[1]-p[1])-(q[1]-p[1])*(r[0]-p[0])\r\n    def onseg(p,q,r):  return (min(p[0],r[0])-1e-9<=q[0]<=max(p[0],r[0])+1e-9 and\r\n                                min(p[1],r[1])-1e-9<=q[1]<=max(p[1],r[1])+1e-9)\r\n    o1=orient(a1,a2,b1); o2=orient(a1,a2,b2); o3=orient(b1,b2,a1); o4=orient(b1,b2,a2)\r\n    if (o1*o2<0) and (o3*o4<0): return 0.0\r\n    if abs(o1)<1e-9 and onseg(a1,b1,a2): return 0.0\r\n    if abs(o2)<1e-9 and onseg(a1,b2,a2): return 0.0\r\n    if abs(o3)<1e-9 and onseg(b1,a1,b2): return 0.0\r\n    if abs(o4)<1e-9 and onseg(b1,a2,b2): return 0.0\r\n    # Take the nearest point distance when they do not intersect\r\n    def dpt(pt,a,b):\r\n        px,py=pt; ax,ay=a; bx,by=b\r\n        vx,vy=bx-ax,by-ay; wx,wy=px-ax,py-ay\r\n        c1=vx*wx+vy*wy\r\n        if c1<=0: return math.hypot(wx,wy)\r\n        c2=vx*vx+vy*vy\r\n        if c2<=1e-12: return math.hypot(wx,wy)\r\n        t=c1/c2\r\n        if t>=1.0: return math.hypot(px-bx,py-by)\r\n        return math.hypot(px-(ax+t*vx), py-(ay+t*vy))\r\n    return min(dpt(a1,b1,b2), dpt(a2,b1,b2), dpt(b1,a1,a2), dpt(b2,a1,a2))\r\n\r\ndef intersect_point(a1,a2,b1,b2):\r\n    # Find the intersection point of line segments ,return None if they do not strictly intersect\r\n    def det(a,b,c,d): return a*d-b*c\r\n    xdiff=(a1[0]-a2[0], b1[0]-b2[0])\r\n    ydiff=(a1[1]-a2[1], b1[1]-b2[1])\r\n    div=det(*xdiff,*ydiff)\r\n    if abs(div)<1e-12: return None\r\n    d=(det(*a1,*a2), det(*b1,*b2))\r\n    x=det(d[0],xdiff[0],d[1],xdiff[1])/div\r\n    y=det(d[0],ydiff[0],d[1],ydiff[1])/div\r\n    \r\n    def onseg(p,q,r):\r\n        return (min(p[0],r[0])-1e-9 <= q[0] <= max(p[0],r[0])+1e-9 and\r\n                min(p[1],r[1])-1e-9 <= q[1] <= max(p[1],r[1])+1e-9)\r\n    if onseg(a1,(x,y),a2) and onseg(b1,(x,y),b2):\r\n        return (x,y)\r\n    return None\r\n\r\ndef merge_ranges(ranges, gap=MERGE_GAP_M):\r\n    if not ranges: return []\r\n    rs=sorted(ranges, key=lambda t:t[0])\r\n    out=[list(rs[0])]\r\n    for s,e in rs[1:]:\r\n        if s - out[-1][1] <= gap: out[-1][1] = max(out[-1][1], e)\r\n        else: out.append([s,e])\r\n    return out\r\n\r\ndef range_text(s,e,L):\r\n    if e - s >= L - ENTIRE_TOL_M: return \"entire\"\r\n    s_=round(s,RANGE_ROUND); e_=round(e,RANGE_ROUND)\r\n    if s <= ENTIRE_TOL_M and e < L-ENTIRE_TOL_M: return \"start-{}\".format(e_)\r\n    if s > ENTIRE_TOL_M and e >= L-ENTIRE_TOL_M: return \"{}-end\".format(s_)\r\n    return \"{}-{}\".format(s_,e_)\r\n\r\ndef rect_edges(x0,x1,y0,y1):\r\n    return {\r\n        \"west\":  (XYZ(x0,y0,0), XYZ(x0,y1,0), True),\r\n        \"east\":  (XYZ(x1,y0,0), XYZ(x1,y1,0), True),\r\n        \"south\": (XYZ(x0,y0,0), XYZ(x1,y0,0), False),\r\n        \"north\": (XYZ(x0,y1,0), XYZ(x1,y1,0), False),\r\n    }\r\n\r\ndef project_on_edge(A,B,seg,vertical):\r\n    a=p2d(A); b=p2d(B)\r\n    s0=p2d(seg.GetEndPoint(0)); s1=p2d(seg.GetEndPoint(1))\r\n    # Minimum distance (feet) from an edge to determine if it belongs to that edge\r\n    if seg_min_dist_2d(a,b,s0,s1) > EDGE_NEAR_M*M_TO_FT: return None\r\n    L = (abs(B.Y-A.Y) if vertical else abs(B.X-A.X)) * FT_TO_M\r\n    if vertical:\r\n        s = max(0.0, min(L, abs(seg.GetEndPoint(0).Y - A.Y)*FT_TO_M))\r\n        e = max(0.0, min(L, abs(seg.GetEndPoint(1).Y - A.Y)*FT_TO_M))\r\n    else:\r\n        s = max(0.0, min(L, abs(seg.GetEndPoint(0).X - A.X)*FT_TO_M))\r\n        e = max(0.0, min(L, abs(seg.GetEndPoint(1).X - A.X)*FT_TO_M))\r\n    if e < s: s,e = e,s\r\n    if e - s <= 1e-4: return None\r\n    return (s,e,L)\r\n\r\ndef cluster(values, tol_m):\r\n    vals=sorted(values)\r\n    bins=[]\r\n    tol_ft=tol_m*M_TO_FT\r\n    for v in vals:\r\n        if not bins or abs(v-bins[-1][-1])>tol_ft: bins.append([v])\r\n        else: bins[-1].append(v)\r\n    return [sum(b)/len(b) for b in bins]\r\n\r\n# Level & Areas\r\nlvl=None\r\nfor L in FilteredElementCollector(doc).OfClass(Level):\r\n    if (L.Name or \"\").strip().lower()==LEVEL_NAME.strip().lower():\r\n        lvl=L; break\r\nif not lvl: raise Exception(\"Level '{}' not found\".format(LEVEL_NAME))\r\n\r\nareas=[a for a in FilteredElementCollector(doc)\r\n       .OfCategory(BuiltInCategory.OST_Areas).WhereElementIsNotElementType()\r\n       if isinstance(a,Area) and a.LevelId.IntegerValue==lvl.Id.IntegerValue]\r\nif not areas: raise Exception(\"No Areas on {}\".format(LEVEL_NAME))\r\n\r\n# Get boundary\r\nopts=SpatialElementBoundaryOptions()\r\nmods=[]\r\nfor a in areas:\r\n    loops=a.GetBoundarySegments(opts)\r\n    if not loops: continue\r\n    xs=[]; ys=[]\r\n    for loop in loops:\r\n        for seg in loop:\r\n            crv=seg.GetCurve()\r\n            p0=crv.GetEndPoint(0); p1=crv.GetEndPoint(1)\r\n            xs += [p0.X,p1.X]; ys += [p0.Y,p1.Y]\r\n    x0=min(xs); x1=max(xs); y0=min(ys); y1=max(ys)\r\n    mods.append({\"x0\":x0,\"x1\":x1,\"y0\":y0,\"y1\":y1})\r\n\r\n#  collect HSS \r\nall_fr=list(FilteredElementCollector(doc)\r\n            .OfCategory(BuiltInCategory.OST_StructuralFraming)\r\n            .WhereElementIsNotElementType())\r\nbrace_lines=[]\r\nfor e in all_fr:\r\n    ln=get_line(e)\r\n    if not ln: continue\r\n    tn,fn=get_type_family_name(e)\r\n    nm=(getattr(e,\"Name\",\"\") or \"\")\r\n    if is_hs_or_hss_square(nm) or is_hs_or_hss_square(tn) or is_hs_or_hss_square(fn):\r\n        brace_lines.append(ln)\r\n\r\n# sort in order \r\n# First cluster by the west edge\r\ncol_keys = cluster([m[\"x0\"] for m in mods], COL_CLUSTER_M)\r\nfor m in mods:\r\n    m[\"col\"] = min(range(len(col_keys)), key=lambda i: abs(m[\"x0\"]-col_keys[i]))\r\n\r\n# Each column from bottom to top\r\ncolumns=[]\r\nfor ci in sorted(set(m[\"col\"] for m in mods)):\r\n    col=sorted([m for m in mods if m[\"col\"]==ci], key=lambda m:m[\"y0\"])\r\n    columns.append(col)\r\n\r\n# Generate module order and position labels\r\nordered=[]; id_of_bottom_in_col=[]\r\nmodule_id=0\r\nfor c_idx, col in enumerate(columns):\r\n    for r_idx, m in enumerate(col):\r\n        module_id += 1\r\n        m[\"id\"] = module_id\r\n        if c_idx==0 and r_idx==0:\r\n            loc=\"south-west\"\r\n        elif r_idx==0:\r\n            # New column bottom: east-{previous column bottom module ID}\r\n            loc=\"east-{}\".format(id_of_bottom_in_col[-1])\r\n        else:\r\n            # In the same column upwards: north-{ID of the module directly below}\r\n            loc=\"north-{}\".format(col[r_idx-1][\"id\"])\r\n        m[\"location\"]=loc\r\n        if r_idx==0 and len(id_of_bottom_in_col)==c_idx: id_of_bottom_in_col.append(m[\"id\"])\r\n        ordered.append(m)\r\n\r\n# calculate gap_we \r\ngaps=[]\r\nfor c1,c2 in zip(columns[:-1], columns[1:]):\r\n    x1=max(m[\"x1\"] for m in c1); x2=min(m[\"x0\"] for m in c2)\r\n    gaps.append( (x2 - x1) * FT_TO_M )\r\ngap_we = round(min(gaps),3) if gaps else 0.0\r\n\r\n# Identify brace side/range/type\r\ndef inside_rect(x0,x1,y0,y1, P):\r\n    x,y=P.X,P.Y\r\n    return (x0-1e-6<=x<=x1+1e-6) and (y0-1e-6<=y<=y1+1e-6)\r\n\r\nrows=[]\r\nfor m in ordered:\r\n    x0,x1,y0,y1 = m[\"x0\"],m[\"x1\"],m[\"y0\"],m[\"y1\"]\r\n    \r\n    we = round((x1-x0)*FT_TO_M,3)   # horizontal E–W\r\n    sn = round((y1-y0)*FT_TO_M,3)   # vertical   N–S\r\n\r\n    \r\n    in_mod=[]\r\n    for ln in brace_lines:\r\n        a=ln.GetEndPoint(0); b=ln.GetEndPoint(1)\r\n        if inside_rect(x0,x1,y0,y1,a) or inside_rect(x0,x1,y0,y1,b):\r\n            in_mod.append(ln)\r\n\r\n    # First determine the type: there are two intersections inside the rectangle, the intersection point is > EDGE_MARGIN_M from the boundary and the angle is > ANG_MIN_X_DEG → X\r\n    mtype=\"Chevron\"\r\n    for i in range(len(in_mod)):\r\n        a1=p2d(in_mod[i].GetEndPoint(0)); a2=p2d(in_mod[i].GetEndPoint(1))\r\n        va=XYZ(a2[0]-a1[0], a2[1]-a1[1], 0.0)\r\n        for j in range(i+1,len(in_mod)):\r\n            b1=p2d(in_mod[j].GetEndPoint(0)); b2=p2d(in_mod[j].GetEndPoint(1))\r\n            vb=XYZ(b2[0]-b1[0], b2[1]-b1[1], 0.0)\r\n            ip=intersect_point(a1,a2,b1,b2)\r\n            if not ip: continue\r\n            x,y=ip\r\n            if not (x0+EDGE_MARGIN_M*M_TO_FT <= x <= x1-EDGE_MARGIN_M*M_TO_FT and\r\n                    y0+EDGE_MARGIN_M*M_TO_FT <= y <= y1-EDGE_MARGIN_M*M_TO_FT):\r\n                continue\r\n            # \r\n            def ang(u,v):\r\n                nu=math.hypot(u.X,u.Y); nv=math.hypot(v.X,v.Y)\r\n                if nu<1e-9 or nv<1e-9: return 0.0\r\n                dot=(u.X*v.X+u.Y*v.Y)/(nu*nv)\r\n                dot=max(-1.0,min(1.0,dot))\r\n                return math.degrees(math.acos(dot))\r\n            if ang(va,vb) > ANG_MIN_X_DEG:\r\n                mtype=\"X\"; break\r\n        if mtype==\"X\": break\r\n\r\n    # \r\n    edges = rect_edges(x0,x1,y0,y1)\r\n    brace_items=[]\r\n    for side,(A,B,vertical) in edges.items():\r\n        L = (abs(B.Y-A.Y) if vertical else abs(B.X-A.X)) * FT_TO_M\r\n        ranges=[]\r\n        for ln in in_mod:\r\n            pr = project_on_edge(A,B,ln,vertical)\r\n            if pr is None: continue\r\n            s,e,_=pr\r\n            ranges.append([s,e])\r\n        for s,e in merge_ranges(ranges):\r\n            brace_items.append({\"side\":side, \"range\":range_text(s,e,L), \"type\":mtype})\r\n\r\n    rows.append([\r\n        m[\"id\"], we, sn, m[\"location\"],\r\n        json.dumps(brace_items, ensure_ascii=False, separators=(',',':'))\r\n    ])\r\n\r\n\r\np = ensure_path(CSV_PATH)\r\nwith open(p,\"w\",newline=\"\",encoding=\"utf-8\") as f:\r\n    w=csv.writer(f)\r\n    w.writerow([\"gap_we (m)\", gap_we])                   \r\n    w.writerow([\"module\",\"we-dir\",\"sn-dir\",\"location\",\"brace\"])\r\n    w.writerows(rows)\r\n\r\nOUT = {\"csv\": p, \"modules\": len(rows), \"gap_we\": gap_we}\r\n",
+      "Engine": "CPython3",
+      "EngineName": "CPython3",
+      "VariableInputPorts": true,
+      "Id": "b713376b40d04ec486843cc2d9551ed3",
+      "NodeType": "PythonScriptNode",
+      "Inputs": [
+        {
+          "Id": "ba46812c896f478884c6e81c43c7803e",
+          "Name": "IN[0]",
+          "Description": "Input #0",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Outputs": [
+        {
+          "Id": "0073ac91c17243a5b3c05a83d7fd314a",
+          "Name": "OUT",
+          "Description": "Result of the python script",
+          "UsingDefaultValue": false,
+          "Level": 2,
+          "UseLevels": false,
+          "KeepListStructure": false
+        }
+      ],
+      "Replication": "Disabled",
+      "Description": "Runs an embedded Python script."
+    }
+  ],
+  "Connectors": [],
+  "Dependencies": [],
+  "NodeLibraryDependencies": [],
+  "Thumbnail": "",
+  "GraphDocumentationURL": null,
+  "ExtensionWorkspaceData": [
+    {
+      "ExtensionGuid": "28992e1d-abb9-417f-8b1b-05e053bee670",
+      "Name": "Properties",
+      "Version": "2.19",
+      "Data": {}
+    },
+    {
+      "ExtensionGuid": "DFBD9CC0-DB40-457A-939E-8C8555555A9D",
+      "Name": "Generative Design",
+      "Version": "6.1",
+      "Data": {}
+    }
+  ],
+  "Author": "",
+  "Linting": {
+    "activeLinter": "None",
+    "activeLinterId": "7b75fb44-43fd-4631-a878-29f4d5d8399a",
+    "warningCount": 0,
+    "errorCount": 0
+  },
+  "Bindings": [],
+  "View": {
+    "Dynamo": {
+      "ScaleFactor": 1.0,
+      "HasRunWithoutCrash": true,
+      "IsVisibleInDynamoLibrary": true,
+      "Version": "2.19.3.6394",
+      "RunType": "Automatic",
+      "RunPeriod": "1000"
+    },
+    "Camera": {
+      "Name": "_Background Preview",
+      "EyeX": -17.0,
+      "EyeY": 24.0,
+      "EyeZ": 50.0,
+      "LookX": 12.0,
+      "LookY": -13.0,
+      "LookZ": -58.0,
+      "UpX": 0.0,
+      "UpY": 1.0,
+      "UpZ": 0.0
+    },
+    "ConnectorPins": [],
+    "NodeViews": [
+      {
+        "Id": "b713376b40d04ec486843cc2d9551ed3",
+        "Name": "Python Script",
+        "IsSetAsInput": false,
+        "IsSetAsOutput": false,
+        "Excluded": false,
+        "ShowGeometry": true,
+        "X": 800.5,
+        "Y": 437.5
+      }
+    ],
+    "Annotations": [],
+    "X": 0.0,
+    "Y": 0.0,
+    "Zoom": 1.0
+  }
+}
